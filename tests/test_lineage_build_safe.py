@@ -35,6 +35,9 @@ class MonitorTest(unittest.TestCase):
     def test_low_ram_reduces_jobs(self):
         self.assertEqual(self.monitor(6, [1] * 3, [1] * 3), 'down')
 
+    def test_ram_pressure_reduces_jobs_before_swap(self):
+        self.assertEqual(self.monitor(16, [0] * 3, [3] * 3), 'down')
+
     def test_recovery_timer_resets(self):
         self.assertEqual(self.monitor(4, [1, 1, 3, 1, 1, 1], [8] * 6,
                                       times=[0, 0, 60, 100, 100, 160, 220],
@@ -149,7 +152,7 @@ class LauncherTest(unittest.TestCase):
         result, processes, monitors = self.run_launcher(['down', 'up', 0])
         self.assertEqual(result, 0)
         self.assertEqual(len(processes), 3)
-        self.assertEqual([p.args[0][-2] for p in processes], ['-j8', '-j6', '-j8'])
+        self.assertEqual([p.args[0][-2] for p in processes], ['-j16', '-j14', '-j16'])
         self.assertNotIn('--skip-soong', processes[0].args[0])
         for process in processes[1:]:
             self.assertIn('--skip-soong', process.args[0])

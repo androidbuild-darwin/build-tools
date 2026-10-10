@@ -119,7 +119,7 @@ def monitor(process, jobs, max_jobs, high_limit, low_limit, low_for,
         last_progress = progress
         change = None
         if jobs > 2:
-            pressured = used >= high_limit or headroom < 2 * GIB
+            pressured = used >= high_limit or headroom < 4 * GIB
             over_limit = over_limit + 1 if pressured else 0
             if over_limit >= samples:
                 change = "down"
@@ -156,7 +156,7 @@ def main():
     parser.add_argument("--root", type=Path,
                         default=Path("/Volumes/AndroidBuild/lineage-21"))
     job_choices = tuple(range(2, 17, 2))
-    parser.add_argument("--jobs", type=int, choices=job_choices, default=8)
+    parser.add_argument("--jobs", type=int, choices=job_choices, default=16)
     parser.add_argument("--max-jobs", type=int, choices=job_choices, default=16)
     parser.add_argument("--fallback-at", type=float, default=4,
                         help="Swap GiB at which to reduce jobs by two (default: 4)")
