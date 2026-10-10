@@ -179,7 +179,8 @@ def monitor(process, jobs, max_jobs, high_limit, low_limit, low_for,
                           flush=True)
                 deferred = True
             else:
-                message = (f"Adjusting jobs {change}: swap {used / GIB:.2f} GiB, "
+                next_jobs = min(max_jobs, jobs + 2) if change == "up" else max(2, jobs - 2)
+                message = (f"Adjusting jobs {change} to {next_jobs}: swap {used / GIB:.2f} GiB, "
                            f"headroom {headroom / GIB:.2f} GiB.")
                 if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
                     message = f"\033[33m{message}\033[0m"
