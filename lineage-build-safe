@@ -143,8 +143,11 @@ def monitor(process, jobs, max_jobs, high_limit, low_limit, low_for,
                           flush=True)
                 deferred = True
             else:
-                print(f"\nAdjusting jobs {change}: swap {used / GIB:.2f} GiB, "
-                      f"headroom {headroom / GIB:.2f} GiB.", flush=True)
+                message = (f"Adjusting jobs {change}: swap {used / GIB:.2f} GiB, "
+                           f"headroom {headroom / GIB:.2f} GiB.")
+                if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
+                    message = f"\033[33m{message}\033[0m"
+                print("\n" + message, flush=True)
                 stop_build(process)
                 return change
         time.sleep(interval)
