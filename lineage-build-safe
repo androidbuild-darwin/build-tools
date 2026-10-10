@@ -49,13 +49,23 @@ def log_mtime(path):
 
 def kernel_running(process):
     output = subprocess.check_output(
-        ["/bin/ps", "-axo", "pgid=,args="], text=True
+        ["/bin/ps", "-axo", "pid=,ppid=,args="], text=True
     )
+    table = {}
     for line in output.splitlines():
-        fields = line.strip().split(None, 1)
-        if len(fields) != 2 or fields[0] != str(process.pid):
-            continue
-        command = fields[1]
+        fields = line.strip().split(None, 2)
+        if len(fields) == 3:
+            table[int(fields[0])] = (int(fields[1]), fields[2])
+    # Ninja recipes have their own process groups. Follow descendants instead.
+    descendants = {process.pid}
+    while True:
+        children = {pid for pid, (parent, _) in table.items()
+                    if parent in descendants}
+        if children <= descendants:
+            break
+        descendants.update(children)
+    for pid in descendants:
+        command = table.get(pid, (None, ""))[1]
         if ("KERNEL_OBJ" in command or "KBUILD_SRC=" in command) and (
                 "/make " in command or "KBUILD_SRC=" in command):
             return True

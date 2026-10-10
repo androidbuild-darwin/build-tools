@@ -122,12 +122,17 @@ Pages inactive: 999.
             self.assertEqual(kernel.call_count, 3)
             stop.assert_called_once_with(process)
 
-    def test_kernel_detection_ignores_other_build_groups(self):
+    def test_kernel_detection_ignores_unrelated_builds(self):
         process = Mock(pid=123)
-        output = '999 /tools/make O=/out/KERNEL_OBJ Image\n123 ninja bacon\n'
+        output = '999 1 /tools/make O=/out/KERNEL_OBJ Image\n123 1 soong_ui bacon\n'
         with patch.object(build.subprocess, 'check_output', return_value=output):
             self.assertFalse(build.kernel_running(process))
-        output += '123 /tools/make O=/out/KERNEL_OBJ Image\n'
+
+    def test_kernel_detection_follows_ninja_descendants(self):
+        process = Mock(pid=123)
+        # ps ordering must not matter, and a nested recipe may have its own group.
+        output = ('456 234 /tools/make O=/out/KERNEL_OBJ Image\n'
+                  '234 123 ninja bacon\n123 1 soong_ui bacon\n')
         with patch.object(build.subprocess, 'check_output', return_value=output):
             self.assertTrue(build.kernel_running(process))
 
