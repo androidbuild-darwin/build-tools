@@ -132,6 +132,34 @@ Pages inactive: 999.
             self.assertTrue(build.kernel_running(process))
 
 
+class StopBuildTest(unittest.TestCase):
+    def test_waits_for_child_in_separate_group_after_driver_exits(self):
+        process = Mock(pid=100)
+        process.poll.side_effect = [None, 0, 0]
+        driver = (1, 100, 'S', 'driver start')
+        child = (100, 200, 'S', 'child start')
+        orphan = (1, 200, 'S', 'child start')
+        with patch.object(build, 'process_table', side_effect=[
+                {100: driver, 200: child}, {200: orphan}, {}]), \
+             patch.object(build.os, 'kill') as kill, \
+             patch.object(build.time, 'sleep') as sleep:
+            build.stop_build(process)
+        self.assertEqual({call.args[0] for call in kill.call_args_list}, {100, 200})
+        sleep.assert_called_once_with(0.2)
+        process.wait.assert_called_once()
+
+    def test_does_not_signal_reused_child_pid(self):
+        process = Mock(pid=100)
+        process.poll.side_effect = [None, 0]
+        with patch.object(build, 'process_table', side_effect=[
+                {100: (1, 100, 'S', 'driver'), 200: (100, 200, 'S', 'old')},
+                {200: (1, 200, 'S', 'new')}]), \
+             patch.object(build.os, 'kill') as kill:
+            build.stop_build(process)
+        self.assertEqual(kill.call_count, 2)
+        process.wait.assert_called_once()
+
+
 class LauncherTest(unittest.TestCase):
     def run_launcher(self, results):
         with tempfile.TemporaryDirectory() as directory:
