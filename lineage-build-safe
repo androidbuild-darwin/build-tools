@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Adjust LineageOS build parallelism to macOS swap usage."""
+
+import argparse
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+GIB = 1024 ** 3
+
+
+def swap_used():
+    output = subprocess.check_output(
+        ["/usr/sbin/sysctl", "-n", "vm.swapusage"], text=True
+    )
+    match = re.search(r"used\s*=\s*([\d.]+)([KMGT])", output)
+    if not match:
+        raise RuntimeError("Cannot read swap usage: " + output.strip())
+    return float(match[1]) * 1024 ** ("KMGT".index(match[2]) + 1)
+
+
+def free_memory():
+    # Conservative headroom estimate: exclude inactive pages, which may
+    # contain dirty anonymous memory as well as reclaimable file cache.
+    output = subprocess.check_output(["/usr/bin/vm_stat"], text=True)
+    page_size = re.search(r"page size of (\d+) bytes", output)
+    if not page_size:
+        raise RuntimeError("Cannot read VM page size")
+    pages = 0
+    for name in ("free", "speculative", "purgeable"):
+        match = re.search(r"Pages " + name + r":\s*(\d+)", output)
+        if not match:
+            raise RuntimeError("Cannot read VM pages: " + name)
+        pages += int(match[1])
+    return pages * int(page_size[1])
+
+
+def log_mtime(path):
+    try:
+        return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
+def stop_build(process):
+    # Signal the build's own process group, including compiler children.
+    for sig, timeout in ((signal.SIGINT, 45), (signal.SIGTERM, 15),
+                         (signal.SIGKILL, 5)):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            process.wait()
+            return
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            continue
+        # A build driver can exit before its compiler children. Remove any
+        # remaining members of this same group before starting another build.
+        for cleanup_signal in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, cleanup_signal)
+            except ProcessLookupError:
+                break
+            if cleanup_signal == signal.SIGTERM:
+                time.sleep(1)
+        return
+    raise RuntimeError("Build process group did not stop; refusing to restart")
+
+
+def monitor(process, jobs, max_jobs, high_limit, low_limit, low_for,
+            progress_log, interval=5, samples=3):
+    over_limit = 0
+    low_since = None
+    last_progress = log_mtime(progress_log)
+    while process.poll() is None:
+        used = swap_used()
+        headroom = free_memory()
+        progress = log_mtime(progress_log)
+        job_finished = progress is not None and progress != last_progress
+        last_progress = progress
+        if jobs > 2:
+            pressured = used >= high_limit or headroom < 2 * GIB
+            over_limit = over_limit + 1 if pressured else 0
+            if over_limit >= samples:
+                print(f"\nMemory pressure: swap {used / GIB:.2f} GiB, "
+                      f"headroom {headroom / GIB:.2f} GiB; reducing jobs.",
+                      flush=True)
+                stop_build(process)
+                return "down"
+        if jobs < max_jobs:
+            if used < low_limit and headroom >= 6 * GIB:
+                if low_since is None:
+                    low_since = time.monotonic()
+                # Only raise parallelism while Ninja is completing jobs.
+                # Avoid interrupting graph generation or a lone long link.
+                if time.monotonic() - low_since >= low_for and job_finished:
+                    print(f"\nMemory stable for {low_for:g} seconds; "
+                          "increasing jobs.", flush=True)
+                    stop_build(process)
+                    return "up"
+            else:
+                low_since = None
+        time.sleep(interval)
+    return process.returncode
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path,
+                        default=Path("/Volumes/AndroidBuild/lineage-21"))
+    parser.add_argument("--jobs", type=int, choices=(2, 4, 6, 8), default=4)
+    parser.add_argument("--max-jobs", type=int, choices=(4, 6, 8), default=8)
+    parser.add_argument("--fallback-at", type=float, default=4,
+                        help="Swap GiB at which to reduce jobs by two (default: 4)")
+    parser.add_argument("--resume-below", type=float, default=2,
+                        help="Swap GiB below which jobs may increase (default: 2)")
+    parser.add_argument("--resume-after", type=float, default=120,
+                        help="Seconds continuously below resume threshold (default: 120)")
+    parser.add_argument("target", nargs="?", default="bacon")
+    args = parser.parse_args()
+    if not all(math.isfinite(value) for value in
+               (args.resume_below, args.fallback_at, args.resume_after)):
+        parser.error("Thresholds must be finite")
+    if not 0 < args.resume_below < args.fallback_at or args.resume_after <= 0:
+        parser.error("Require 0 < resume-below < fallback-at and resume-after > 0")
+    if args.jobs > args.max_jobs:
+        parser.error("jobs must not exceed max-jobs")
+    root = args.root.resolve()
+    build = root / "build/soong/soong_ui.bash"
+    if not build.is_file():
+        parser.error(f"Missing build script: {build}")
+
+    # Prevent two copies of this supervisor from running together.
+    import fcntl
+    lock = open(root / "out/.safe-build.lock", "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        parser.error("Another safe build is already running")
+
+    used = swap_used()
+    jobs = 2 if used >= args.fallback_at * GIB or free_memory() < 2 * GIB else args.jobs
+    env = os.environ.copy()
+    env.update(T=str(root), TARGET_PRODUCT="lineage_a5y17lte",
+               TARGET_RELEASE="ap2a", TARGET_BUILD_VARIANT="userdebug",
+               LINEAGE_BUILD="a5y17lte", GOMAXPROCS="4")
+    env["PATH"] = ("/Volumes/AndroidBuild/tools/bin:"
+                   f"{root}/prebuilts/build-tools/path/darwin-x86:"
+                   + env.get("PATH", ""))
+
+    process = None
+    try:
+        while True:
+            print(f"Starting -j{jobs} (range 2..{args.max_jobs}); "
+                  f"swap {swap_used() / GIB:.2f} GiB. "
+                  "At -j2, swap never stops the build.", flush=True)
+            process = subprocess.Popen(
+                ["/bin/bash", str(build), "--make-mode",
+                 "--skip-soong-tests", f"-j{jobs}", args.target],
+                cwd=root, env=env, start_new_session=True)
+            result = monitor(
+                process, jobs, args.max_jobs,
+                high_limit=args.fallback_at * GIB,
+                low_limit=args.resume_below * GIB,
+                low_for=args.resume_after,
+                progress_log=root / "out/.ninja_log")
+            if isinstance(result, int):
+                return result if result >= 0 else 128 - result
+            process = None
+            jobs = min(args.max_jobs, jobs + 2) if result == "up" else max(2, jobs - 2)
+            print(f"Resuming with -j{jobs}. Completed outputs are retained.", flush=True)
+    except KeyboardInterrupt:
+        print("\nInterrupted; stopping build without restarting.", flush=True)
+        if process is not None:
+            stop_build(process)
+        return 130
+    except Exception:
+        if process is not None:
+            stop_build(process)
+        raise
+    finally:
+        lock.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
