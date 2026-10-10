@@ -47,6 +47,28 @@ def log_mtime(path):
         return None
 
 
+def kernel_running(process):
+    output = subprocess.check_output(
+        ["/bin/ps", "-axo", "pgid=,args="], text=True
+    )
+    for line in output.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2 or fields[0] != str(process.pid):
+            continue
+        command = fields[1]
+        if ("KERNEL_OBJ" in command or "KBUILD_SRC=" in command) and (
+                "/make " in command or "KBUILD_SRC=" in command):
+            return True
+    return False
+
+
+def build_command(build, jobs, target, resume=False):
+    command = ["/bin/bash", str(build), "--make-mode", "--skip-soong-tests"]
+    if resume:
+        command += ["--skip-make", "--skip-soong"]
+    return command + [f"-j{jobs}", target]
+
+
 def stop_build(process):
     # Signal the build's own process group, including compiler children.
     for sig, timeout in ((signal.SIGINT, 45), (signal.SIGTERM, 15),
@@ -74,25 +96,33 @@ def stop_build(process):
 
 
 def monitor(process, jobs, max_jobs, high_limit, low_limit, low_for,
-            progress_log, interval=5, samples=3):
+            progress_log, interval=5, samples=3, ready_file=None,
+            ready_before=None):
     over_limit = 0
     low_since = None
     last_progress = log_mtime(progress_log)
+    deferred = False
     while process.poll() is None:
+        # Soong writes ninja.environment just before starting the main Ninja.
+        # -j does not limit graph analysis, so restarting that phase cannot help.
+        if ready_file is not None:
+            ready = log_mtime(ready_file)
+            if ready is None or ready == ready_before:
+                time.sleep(interval)
+                continue
+            ready_file = None
+            print("Build graph ready; monitoring compiler jobs.", flush=True)
         used = swap_used()
         headroom = free_memory()
         progress = log_mtime(progress_log)
         job_finished = progress is not None and progress != last_progress
         last_progress = progress
+        change = None
         if jobs > 2:
             pressured = used >= high_limit or headroom < 2 * GIB
             over_limit = over_limit + 1 if pressured else 0
             if over_limit >= samples:
-                print(f"\nMemory pressure: swap {used / GIB:.2f} GiB, "
-                      f"headroom {headroom / GIB:.2f} GiB; reducing jobs.",
-                      flush=True)
-                stop_build(process)
-                return "down"
+                change = "down"
         if jobs < max_jobs:
             if used < low_limit and headroom >= 6 * GIB:
                 if low_since is None:
@@ -100,12 +130,23 @@ def monitor(process, jobs, max_jobs, high_limit, low_limit, low_for,
                 # Only raise parallelism while Ninja is completing jobs.
                 # Avoid interrupting graph generation or a lone long link.
                 if time.monotonic() - low_since >= low_for and job_finished:
-                    print(f"\nMemory stable for {low_for:g} seconds; "
-                          "increasing jobs.", flush=True)
-                    stop_build(process)
-                    return "up"
+                    if change is None:
+                        change = "up"
             else:
                 low_since = None
+        if change is not None:
+            # Keep a running kernel recipe intact. Interrupted Image recipes
+            # are not recorded as complete by Ninja and must run again.
+            if kernel_running(process):
+                if not deferred:
+                    print("\nJob change pending; waiting for the kernel to finish.",
+                          flush=True)
+                deferred = True
+            else:
+                print(f"\nAdjusting jobs {change}: swap {used / GIB:.2f} GiB, "
+                      f"headroom {headroom / GIB:.2f} GiB.", flush=True)
+                stop_build(process)
+                return change
         time.sleep(interval)
     return process.returncode
 
@@ -114,14 +155,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path,
                         default=Path("/Volumes/AndroidBuild/lineage-21"))
-    parser.add_argument("--jobs", type=int, choices=(2, 4, 6, 8), default=4)
-    parser.add_argument("--max-jobs", type=int, choices=(4, 6, 8), default=8)
+    job_choices = tuple(range(2, 17, 2))
+    parser.add_argument("--jobs", type=int, choices=job_choices, default=8)
+    parser.add_argument("--max-jobs", type=int, choices=job_choices, default=16)
     parser.add_argument("--fallback-at", type=float, default=4,
                         help="Swap GiB at which to reduce jobs by two (default: 4)")
     parser.add_argument("--resume-below", type=float, default=2,
                         help="Swap GiB below which jobs may increase (default: 2)")
-    parser.add_argument("--resume-after", type=float, default=120,
-                        help="Seconds continuously below resume threshold (default: 120)")
+    parser.add_argument("--resume-after", type=float, default=300,
+                        help="Seconds continuously below resume threshold (default: 300)")
     parser.add_argument("target", nargs="?", default="bacon")
     args = parser.parse_args()
     if not all(math.isfinite(value) for value in
@@ -135,6 +177,9 @@ def main():
     build = root / "build/soong/soong_ui.bash"
     if not build.is_file():
         parser.error(f"Missing build script: {build}")
+    config = root / "build/soong/ui/build/config.go"
+    if not config.is_file() or 'arg == "--skip-soong"' not in config.read_text():
+        parser.error("This launcher requires the androidbuild-darwin Soong --skip-soong patch")
 
     # Prevent two copies of this supervisor from running together.
     import fcntl
@@ -144,37 +189,42 @@ def main():
     except BlockingIOError:
         parser.error("Another safe build is already running")
 
-    used = swap_used()
-    jobs = 2 if used >= args.fallback_at * GIB or free_memory() < 2 * GIB else args.jobs
+    jobs = args.jobs
     env = os.environ.copy()
     env.update(T=str(root), TARGET_PRODUCT="lineage_a5y17lte",
                TARGET_RELEASE="ap2a", TARGET_BUILD_VARIANT="userdebug",
-               LINEAGE_BUILD="a5y17lte", GOMAXPROCS="4")
+               LINEAGE_BUILD="a5y17lte", GOMAXPROCS="2")
     env["PATH"] = ("/Volumes/AndroidBuild/tools/bin:"
                    f"{root}/prebuilts/build-tools/path/darwin-x86:"
                    + env.get("PATH", ""))
 
     process = None
+    resume = False
+    ready_file = root / "out/soong/ninja.environment"
     try:
         while True:
             print(f"Starting -j{jobs} (range 2..{args.max_jobs}); "
                   f"swap {swap_used() / GIB:.2f} GiB. "
                   "At -j2, swap never stops the build.", flush=True)
+            ready_before = log_mtime(ready_file)
             process = subprocess.Popen(
-                ["/bin/bash", str(build), "--make-mode",
-                 "--skip-soong-tests", f"-j{jobs}", args.target],
+                build_command(build, jobs, args.target, resume),
                 cwd=root, env=env, start_new_session=True)
             result = monitor(
                 process, jobs, args.max_jobs,
                 high_limit=args.fallback_at * GIB,
                 low_limit=args.resume_below * GIB,
                 low_for=args.resume_after,
-                progress_log=root / "out/.ninja_log")
+                progress_log=root / "out/.ninja_log",
+                ready_file=None if resume else ready_file,
+                ready_before=ready_before)
             if isinstance(result, int):
                 return result if result >= 0 else 128 - result
             process = None
+            resume = True
             jobs = min(args.max_jobs, jobs + 2) if result == "up" else max(2, jobs - 2)
-            print(f"Resuming with -j{jobs}. Completed outputs are retained.", flush=True)
+            print(f"Resuming with -j{jobs} using the prepared graph. "
+                  "Stop and relaunch after source or configuration edits.", flush=True)
     except KeyboardInterrupt:
         print("\nInterrupted; stopping build without restarting.", flush=True)
         if process is not None:

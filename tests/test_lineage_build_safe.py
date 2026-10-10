@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -21,6 +22,7 @@ class MonitorTest(unittest.TestCase):
              patch.object(build, 'log_mtime', side_effect=logs or [0] * (len(swaps) + 1)), \
              patch.object(build.time, 'monotonic', side_effect=times), \
              patch.object(build.time, 'sleep'), \
+             patch.object(build, 'kernel_running', return_value=False), \
              patch.object(build, 'stop_build') as stop:
             result = build.monitor(process, jobs, 8, 4 * build.GIB, 2 * build.GIB,
                                    120, Path('/unused/ninja_log'))
@@ -62,6 +64,104 @@ Pages purgeable: 5.
 Pages inactive: 999.
 '''):
             self.assertEqual(build.free_memory(), 125 * 16384)
+
+    def test_initial_build_checks_graph_and_resume_reuses_it(self):
+        initial = build.build_command(Path('/root/soong_ui.bash'), 8, 'bacon')
+        resumed = build.build_command(Path('/root/soong_ui.bash'), 6, 'bacon', True)
+        self.assertNotIn('--skip-make', initial)
+        self.assertNotIn('--skip-soong', initial)
+        self.assertIn('--skip-make', resumed)
+        self.assertIn('--skip-soong', resumed)
+        self.assertEqual(resumed[-2:], ['-j6', 'bacon'])
+
+    def test_old_ninja_environment_does_not_interrupt_soong(self):
+        process = Mock()
+        process.poll.side_effect = [None, None, None, 0]
+        process.returncode = 0
+        with patch.object(build, 'log_mtime', return_value=123), \
+             patch.object(build, 'swap_used') as swap, \
+             patch.object(build.time, 'sleep'), \
+             patch.object(build, 'stop_build') as stop:
+            result = build.monitor(process, 8, 16, 4 * build.GIB, 2 * build.GIB,
+                                   300, Path('/log'), ready_file=Path('/env'),
+                                   ready_before=123)
+            self.assertEqual(result, 0)
+            swap.assert_not_called()
+            stop.assert_not_called()
+
+    def test_monitor_starts_only_after_new_ninja_environment(self):
+        process = Mock()
+        process.poll.side_effect = [None] * 5
+        with patch.object(build, 'log_mtime', side_effect=[0, 10, 10, 11, 0, 0, 0]), \
+             patch.object(build, 'swap_used', return_value=5 * build.GIB) as swap, \
+             patch.object(build, 'free_memory', return_value=8 * build.GIB), \
+             patch.object(build, 'kernel_running', return_value=False), \
+             patch.object(build.time, 'sleep'), \
+             patch.object(build, 'stop_build') as stop:
+            result = build.monitor(process, 8, 16, 4 * build.GIB, 2 * build.GIB,
+                                   300, Path('/log'), ready_file=Path('/env'),
+                                   ready_before=10)
+            self.assertEqual(result, 'down')
+            self.assertEqual(swap.call_count, 3)
+            stop.assert_called_once_with(process)
+
+    def test_kernel_recipe_finishes_before_job_change(self):
+        process = Mock()
+        process.poll.return_value = None
+        with patch.object(build, 'log_mtime', return_value=0), \
+             patch.object(build, 'swap_used', return_value=5 * build.GIB), \
+             patch.object(build, 'free_memory', return_value=8 * build.GIB), \
+             patch.object(build, 'kernel_running', side_effect=[True, True, False]) as kernel, \
+             patch.object(build.time, 'sleep'), \
+             patch.object(build, 'stop_build') as stop:
+            self.assertEqual(build.monitor(process, 8, 16, 4 * build.GIB,
+                                           2 * build.GIB, 300, Path('/log')), 'down')
+            self.assertEqual(kernel.call_count, 3)
+            stop.assert_called_once_with(process)
+
+    def test_kernel_detection_ignores_other_build_groups(self):
+        process = Mock(pid=123)
+        output = '999 /tools/make O=/out/KERNEL_OBJ Image\n123 ninja bacon\n'
+        with patch.object(build.subprocess, 'check_output', return_value=output):
+            self.assertFalse(build.kernel_running(process))
+        output += '123 /tools/make O=/out/KERNEL_OBJ Image\n'
+        with patch.object(build.subprocess, 'check_output', return_value=output):
+            self.assertTrue(build.kernel_running(process))
+
+
+class LauncherTest(unittest.TestCase):
+    def run_launcher(self, results):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'out').mkdir()
+            source = root / 'build/soong'
+            (source / 'ui/build').mkdir(parents=True)
+            (source / 'soong_ui.bash').touch()
+            (source / 'ui/build/config.go').write_text('arg == "--skip-soong"')
+            with patch.object(build.sys, 'argv', ['launcher', '--root', directory]), \
+                 patch.object(build, 'swap_used', return_value=0), \
+                 patch.object(build, 'monitor', side_effect=results) as monitor, \
+                 patch.object(build.subprocess, 'Popen') as popen:
+                result = build.main()
+                return result, popen.call_args_list, monitor.call_args_list
+
+    def test_only_in_session_job_changes_skip_graph_analysis(self):
+        result, processes, monitors = self.run_launcher(['down', 'up', 0])
+        self.assertEqual(result, 0)
+        self.assertEqual(len(processes), 3)
+        self.assertEqual([p.args[0][-2] for p in processes], ['-j8', '-j6', '-j8'])
+        self.assertNotIn('--skip-soong', processes[0].args[0])
+        for process in processes[1:]:
+            self.assertIn('--skip-soong', process.args[0])
+            self.assertIn('--skip-make', process.args[0])
+        self.assertIsNotNone(monitors[0].kwargs['ready_file'])
+        self.assertIsNone(monitors[1].kwargs['ready_file'])
+        self.assertEqual(monitors[0].args[2], 16)
+
+    def test_actual_failure_does_not_restart(self):
+        result, processes, _ = self.run_launcher([1])
+        self.assertEqual(result, 1)
+        self.assertEqual(len(processes), 1)
 
 
 if __name__ == '__main__':
