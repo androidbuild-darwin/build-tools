@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Build LineageOS with four jobs and no automatic restarts."""
+
+import argparse
+import fcntl
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path,
+                        default=Path("/Volumes/AndroidBuild/lineage-21"))
+    parser.add_argument("target", nargs="?", default="bacon")
+    args = parser.parse_args()
+    root = args.root.resolve()
+    build = root / "build/soong/soong_ui.bash"
+    if not build.is_file():
+        parser.error(f"Missing build script: {build}")
+
+    # Share command construction and process cleanup with the adaptive launcher.
+    helper_path = Path(__file__).resolve().with_name("lineage-build-safe")
+    if not helper_path.is_file():
+        parser.error(f"Missing companion launcher: {helper_path}")
+    helpers = runpy.run_path(str(helper_path))
+    (root / "out").mkdir(exist_ok=True)
+    with (root / "out/.safe-build.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            parser.error("Another safe build is already running")
+
+        env = os.environ.copy()
+        env.update(T=str(root), TARGET_PRODUCT="lineage_a5y17lte",
+                   TARGET_RELEASE="ap2a", TARGET_BUILD_VARIANT="userdebug",
+                   LINEAGE_BUILD="a5y17lte", GOMAXPROCS="2")
+        env["PATH"] = ("/Volumes/AndroidBuild/tools/bin:"
+                       f"{root}/prebuilts/build-tools/path/darwin-x86:"
+                       + env.get("PATH", ""))
+        process = None
+        try:
+            print("Starting -j4; automatic job adjustments are disabled.", flush=True)
+            process = subprocess.Popen(
+                helpers["build_command"](build, 4, args.target),
+                cwd=root, env=env, start_new_session=True)
+            result = process.wait()
+            return result if result >= 0 else 128 - result
+        except KeyboardInterrupt:
+            print("\nInterrupted; stopping build without restarting.", flush=True)
+            if process is not None:
+                helpers["stop_build"](process)
+            return 130
+        except Exception:
+            if process is not None:
+                helpers["stop_build"](process)
+            raise
+
+
+if __name__ == "__main__":
+    sys.exit(main())
