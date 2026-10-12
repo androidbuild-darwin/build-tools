@@ -76,7 +76,7 @@ def build_command(build, jobs, target, resume=False):
     command = ["/bin/bash", str(build), "--make-mode", "--skip-soong-tests"]
     if resume:
         command += ["--skip-make", "--skip-soong"]
-    return command + [f"-j{jobs}", target]
+    return command + [f"-j{jobs}", "KERNEL_JOBS=8", target]
 
 
 def process_table():

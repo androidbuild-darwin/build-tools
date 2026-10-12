@@ -75,7 +75,8 @@ Pages inactive: 999.
         self.assertNotIn('--skip-soong', initial)
         self.assertIn('--skip-make', resumed)
         self.assertIn('--skip-soong', resumed)
-        self.assertEqual(resumed[-2:], ['-j6', 'bacon'])
+        self.assertIn('KERNEL_JOBS=8', initial)
+        self.assertEqual(resumed[-3:], ['-j6', 'KERNEL_JOBS=8', 'bacon'])
 
     def test_old_ninja_environment_does_not_interrupt_soong(self):
         process = Mock()
@@ -185,7 +186,7 @@ class LauncherTest(unittest.TestCase):
         result, processes, monitors = self.run_launcher(['down', 'up', 0])
         self.assertEqual(result, 0)
         self.assertEqual(len(processes), 3)
-        self.assertEqual([p.args[0][-2] for p in processes], ['-j16', '-j14', '-j16'])
+        self.assertEqual([p.args[0][-3] for p in processes], ['-j16', '-j14', '-j16'])
         self.assertNotIn('--skip-soong', processes[0].args[0])
         for process in processes[1:]:
             self.assertIn('--skip-soong', process.args[0])
